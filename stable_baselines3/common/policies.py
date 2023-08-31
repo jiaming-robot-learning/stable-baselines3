@@ -319,6 +319,32 @@ class BasePolicy(BaseModel, ABC):
         :param deterministic: Whether to use stochastic or deterministic actions
         :return: Taken action according to the policy
         """
+    @abstractmethod
+    def _predict_aux(
+        self,
+        observation: Union[np.ndarray, Dict[str, np.ndarray]],
+        state: Optional[Tuple[np.ndarray, ...]] = None,
+        episode_start: Optional[np.ndarray] = None,
+        deterministic: bool = False,
+    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]], Optional[np.ndarray]]:
+        """
+        Get the action according to the policy for a given observation.
+
+        By default provides a dummy implementation -- not all BasePolicy classes
+        implement this, e.g. if they are a Critic in an Actor-Critic method.
+
+        :param observation:
+        :param deterministic: Whether to use stochastic or deterministic actions
+        :return: Taken action according to the policy
+        """
+    def predict_aux(
+        self,
+        observation: Union[np.ndarray, Dict[str, np.ndarray]],
+        state: Optional[Tuple[np.ndarray, ...]] = None,
+        episode_start: Optional[np.ndarray] = None,
+        deterministic: bool = False,
+    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]], Optional[np.ndarray]]:
+        return self._predict_aux(observation, state, episode_start, deterministic)
 
     def predict(
         self,
@@ -724,6 +750,183 @@ class ActorCriticPolicy(BasePolicy):
         latent_vf = self.mlp_extractor.forward_critic(features)
         return self.value_net(latent_vf)
 
+
+class ActorCriticCnnAuxPolicy(ActorCriticPolicy):
+    """
+    CNN policy class for actor-critic algorithms (has both policy and value prediction).
+    Used by A2C, PPO and the likes.
+
+    :param observation_space: Observation space
+    :param action_space: Action space
+    :param lr_schedule: Learning rate schedule (could be constant)
+    :param net_arch: The specification of the policy and value networks.
+    :param activation_fn: Activation function
+    :param ortho_init: Whether to use or not orthogonal initialization
+    :param use_sde: Whether to use State Dependent Exploration or not
+    :param log_std_init: Initial value for the log standard deviation
+    :param full_std: Whether to use (n_features x n_actions) parameters
+        for the std instead of only (n_features,) when using gSDE
+    :param use_expln: Use ``expln()`` function instead of ``exp()`` to ensure
+        a positive standard deviation (cf paper). It allows to keep variance
+        above zero and prevent it from growing too fast. In practice, ``exp()`` is usually enough.
+    :param squash_output: Whether to squash the output using a tanh function,
+        this allows to ensure boundaries when using gSDE.
+    :param features_extractor_class: Features extractor to use.
+    :param features_extractor_kwargs: Keyword arguments
+        to pass to the features extractor.
+    :param share_features_extractor: If True, the features extractor is shared between the policy and value networks.
+    :param normalize_images: Whether to normalize images or not,
+         dividing by 255.0 (True by default)
+    :param optimizer_class: The optimizer to use,
+        ``th.optim.Adam`` by default
+    :param optimizer_kwargs: Additional keyword arguments,
+        excluding the learning rate, to pass to the optimizer
+    """
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        lr_schedule: Schedule,
+        net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
+        activation_fn: Type[nn.Module] = nn.Tanh,
+        ortho_init: bool = True,
+        use_sde: bool = False,
+        log_std_init: float = 0.0,
+        full_std: bool = True,
+        use_expln: bool = False,
+        squash_output: bool = False,
+        features_extractor_class: Type[BaseFeaturesExtractor] = NatureCNN,
+        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+        share_features_extractor: bool = True,
+        normalize_images: bool = True,
+        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        aux_task_pred_dim: int = None,
+        **kwargs,
+    ):
+        self.aux_task_dim = aux_task_pred_dim
+        if self.aux_task_dim is None:
+            raise ValueError("aux_task_dim must be specified")
+        
+        super().__init__(
+            observation_space,
+            action_space,
+            lr_schedule,
+            net_arch,
+            activation_fn,
+            ortho_init,
+            use_sde,
+            log_std_init,
+            full_std,
+            use_expln,
+            squash_output,
+            features_extractor_class,
+            features_extractor_kwargs,
+            share_features_extractor,
+            normalize_images,
+            optimizer_class,
+            optimizer_kwargs,
+        )
+
+    def _predict_aux(
+        self,
+        observation: Union[np.ndarray, Dict[str, np.ndarray]],
+        state: Optional[Tuple[np.ndarray, ...]] = None,
+        episode_start: Optional[np.ndarray] = None,
+        deterministic: bool = False,
+    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]], Optional[np.ndarray]]:
+        """
+        Get the policy action from an observation (and optional hidden state).
+        Includes sugar-coating to handle different observations (e.g. normalizing images).
+
+        :param observation: the input observation
+        :param state: The last hidden states (can be None, used in recurrent policies)
+        :param episode_start: The last masks (can be None, used in recurrent policies)
+            this correspond to beginning of episodes,
+            where the hidden states of the RNN must be reset.
+        :param deterministic: Whether or not to return deterministic actions.
+        :return: the model's action and the next hidden state
+            (used in recurrent policies)
+        """
+        # Switch to eval mode (this affects batch norm / dropout)
+        self.set_training_mode(False)
+
+        observation, vectorized_env = self.obs_to_tensor(observation)
+
+        with th.no_grad():
+            features = super().extract_features(observation)
+            latent_pi = self.mlp_extractor.forward_actor(features)
+            distribution = self._get_action_dist_from_latent(latent_pi)
+            actions = distribution.get_actions(deterministic=deterministic)
+            aux_pred = self.aux_net(features)
+
+        # Convert to numpy, and reshape to the original action shape
+        actions = actions.cpu().numpy().reshape((-1, *self.action_space.shape))
+
+        if isinstance(self.action_space, spaces.Box):
+            if self.squash_output:
+                # Rescale to proper domain when using squashing
+                actions = self.unscale_action(actions)
+            else:
+                # Actions could be on arbitrary scale, so clip the actions to avoid
+                # out of bound error (e.g. if sampling from a Gaussian distribution)
+                actions = np.clip(actions, self.action_space.low, self.action_space.high)
+
+        aux_pred = aux_pred.cpu().numpy().reshape((-1, self.aux_task_dim))
+
+        # Remove batch dimension if needed
+        if not vectorized_env:
+            actions = actions.squeeze(axis=0)
+            aux_pred = aux_pred.squeeze(axis=0)
+
+        return actions, state, aux_pred
+
+        
+        
+    def _build_mlp_extractor(self) -> None:
+        """
+        Create the policy and value networks.
+        Part of the layers can be shared.
+        """
+        # build aux task network in addition to actor and critic
+        super()._build_mlp_extractor()
+        self.aux_net_hidden_dim = 64
+        
+        # self.aux_net = nn.Sequential( 
+        #     nn.Linear(self.features_dim, self.aux_net_hidden_dim),
+        #     nn.ReLU(),
+        #     nn.Linear(self.aux_net_hidden_dim, self.aux_task_dim),
+        # )
+
+        # let's just use a single linear layer 
+        self.aux_net = nn.Linear(self.features_dim, self.aux_task_dim)
+
+    def evaluate_actions(self, obs: th.Tensor, actions: th.Tensor) -> Tuple[th.Tensor, th.Tensor, Optional[th.Tensor], th.Tensor]:
+        """
+        Evaluate actions according to the current policy,
+        given the observations.
+
+        :param obs: Observation
+        :param actions: Actions
+        :return: estimated value, log likelihood of taking those actions
+            and entropy of the action distribution, and auxiliary task output
+        """
+        # Preprocess the observation if needed
+        features = self.extract_features(obs)
+        if self.share_features_extractor:
+            latent_pi, latent_vf = self.mlp_extractor(features)
+        else:
+            pi_features, vf_features = features
+            latent_pi = self.mlp_extractor.forward_actor(pi_features)
+            latent_vf = self.mlp_extractor.forward_critic(vf_features)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        log_prob = distribution.log_prob(actions)
+        values = self.value_net(latent_vf)
+        entropy = distribution.entropy()
+        aux_out = self.aux_net(features)
+
+        return values, log_prob, entropy, aux_out
+   
 
 class ActorCriticCnnPolicy(ActorCriticPolicy):
     """
